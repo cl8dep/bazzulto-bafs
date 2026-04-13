@@ -47,10 +47,10 @@ use crate::inode::{
 };
 use crate::journal::{begin_transaction, commit_transaction, recover_journal_on_mount};
 use crate::superblock::{
+    compute_data_area_start_block, compute_journal_size_in_blocks,
     read_superblock_from_device, write_superblock_to_device, BafsSuperblock,
     BAFS_BACKUP_SUPERBLOCK_BLOCK_ADDRESS, BAFS_CHECKSUM_ALGORITHM_CRC32C,
-    BAFS_DATA_AREA_START_BLOCK_ADDRESS, BAFS_DEFAULT_BLOCK_SIZE_BYTES,
-    BAFS_DEFAULT_JOURNAL_SIZE_BLOCKS, BAFS_JOURNAL_START_BLOCK_ADDRESS,
+    BAFS_DEFAULT_BLOCK_SIZE_BYTES, BAFS_JOURNAL_START_BLOCK_ADDRESS,
     BAFS_MAGIC_NUMBER, BAFS_PRIMARY_SUPERBLOCK_BLOCK_ADDRESS, BAFS_ROOT_INODE_NUMBER,
     BAFS_SECTORS_PER_BLOCK, BAFS_SUPPORTED_VERSION,
 };
@@ -78,18 +78,10 @@ impl Default for BafsFormatOptions {
 }
 
 // ─── Block addresses reserved at format time ──────────────────────────────────
-
-/// Block address of the initial inode B-tree root (empty leaf node).
-const FORMAT_INODE_TREE_ROOT_BLOCK: u64 = BAFS_DATA_AREA_START_BLOCK_ADDRESS;
-
-/// Block address of the initial free-extent B-tree root.
-const FORMAT_FREE_EXTENT_TREE_ROOT_BLOCK: u64 = BAFS_DATA_AREA_START_BLOCK_ADDRESS + 1;
-
-/// Block address of the initial checksum B-tree root (empty leaf node).
-const FORMAT_CHECKSUM_TREE_ROOT_BLOCK: u64 = BAFS_DATA_AREA_START_BLOCK_ADDRESS + 2;
-
-/// First block available for general allocation after format-time structures.
-const FORMAT_FIRST_ALLOCATABLE_BLOCK: u64 = BAFS_DATA_AREA_START_BLOCK_ADDRESS + 3;
+//
+// These are NOT compile-time constants because the journal size — and therefore
+// the data-area start — depends on the total disk capacity.  All format-time
+// block addresses are computed at runtime inside `bafs_format`.
 
 // ─── Volume handle ────────────────────────────────────────────────────────────
 
@@ -138,7 +130,18 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
     let total_sector_count = device.total_sector_count();
     let total_block_count = total_sector_count / sectors_per_block as u64;
 
-    if total_block_count < FORMAT_FIRST_ALLOCATABLE_BLOCK + 10 {
+    // Compute the journal size and data-area layout dynamically from disk capacity.
+    // This scales from 1 MiB on tiny disks up to 64 MiB on large disks (≥ 256 GiB).
+    let journal_size_in_blocks = compute_journal_size_in_blocks(total_block_count);
+    let data_area_start_block = compute_data_area_start_block(total_block_count);
+
+    // Block addresses for the three initial B-tree roots and first allocatable block.
+    let format_inode_tree_root_block: u64 = data_area_start_block;
+    let format_free_extent_tree_root_block: u64 = data_area_start_block + 1;
+    let format_checksum_tree_root_block: u64 = data_area_start_block + 2;
+    let format_first_allocatable_block: u64 = data_area_start_block + 3;
+
+    if total_block_count < format_first_allocatable_block + 10 {
         // Device is too small to hold even the bare minimum structures.
         return Err(BafsError::OutOfSpace);
     }
@@ -146,32 +149,32 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
     // ── Build format-time structures in a dirty-block cache ──────────────────
 
     let mut dirty_cache: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-    let mut next_free_block = FORMAT_FIRST_ALLOCATABLE_BLOCK;
+    let mut next_free_block = format_first_allocatable_block;
     let format_generation: u64 = 1;
 
     // ── (1) Empty inode B-tree root ───────────────────────────────────────────
     create_empty_tree(
         &mut dirty_cache,
-        FORMAT_INODE_TREE_ROOT_BLOCK,
+        format_inode_tree_root_block,
         format_generation,
     );
 
     // ── (2) Free-extent B-tree root with one entry ────────────────────────────
     //
-    // The initial free extent covers all blocks from FORMAT_FIRST_ALLOCATABLE_BLOCK
+    // The initial free extent covers all blocks from format_first_allocatable_block
     // to the end of the device.
     create_empty_tree(
         &mut dirty_cache,
-        FORMAT_FREE_EXTENT_TREE_ROOT_BLOCK,
+        format_free_extent_tree_root_block,
         format_generation,
     );
-    let mut free_extent_root = FORMAT_FREE_EXTENT_TREE_ROOT_BLOCK;
-    let initial_free_block_count = total_block_count - FORMAT_FIRST_ALLOCATABLE_BLOCK;
+    let mut free_extent_root = format_free_extent_tree_root_block;
+    let initial_free_block_count = total_block_count - format_first_allocatable_block;
     free_extent_root = insert_free_extent_into_tree(
         device,
         &mut dirty_cache,
         free_extent_root,
-        FORMAT_FIRST_ALLOCATABLE_BLOCK,
+        format_first_allocatable_block,
         initial_free_block_count,
         format_generation,
         &mut next_free_block,
@@ -180,11 +183,11 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
     // ── (3) Empty checksum B-tree root ────────────────────────────────────────
     create_empty_tree(
         &mut dirty_cache,
-        FORMAT_CHECKSUM_TREE_ROOT_BLOCK,
+        format_checksum_tree_root_block,
         format_generation,
     );
-    let mut checksum_root = FORMAT_CHECKSUM_TREE_ROOT_BLOCK;
-    let mut inode_root = FORMAT_INODE_TREE_ROOT_BLOCK;
+    let mut checksum_root = format_checksum_tree_root_block;
+    let mut inode_root = format_inode_tree_root_block;
 
     // ── (4) Root directory inode ──────────────────────────────────────────────
 
@@ -239,7 +242,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
         free_extent_tree_root_block: free_extent_root,
         checksum_tree_root_block: checksum_root,
         journal_start_block: BAFS_JOURNAL_START_BLOCK_ADDRESS,
-        journal_size_in_blocks: BAFS_DEFAULT_JOURNAL_SIZE_BLOCKS,
+        journal_size_in_blocks,
         volume_uuid: [options.volume_uuid_lower, 0],
         volume_label: label_words,
         feature_flags: 0,
@@ -251,7 +254,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
     // ── (6) Zero the journal area ─────────────────────────────────────────────
 
     let zeroed_block = vec![0u8; block_size];
-    for journal_block_index in 0..BAFS_DEFAULT_JOURNAL_SIZE_BLOCKS {
+    for journal_block_index in 0..journal_size_in_blocks {
         let lba = (BAFS_JOURNAL_START_BLOCK_ADDRESS + journal_block_index)
             * sectors_per_block as u64;
         if !device.write_sectors(lba, sectors_per_block, &zeroed_block) {

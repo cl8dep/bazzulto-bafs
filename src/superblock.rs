@@ -79,13 +79,42 @@ pub const BAFS_BACKUP_SUPERBLOCK_BLOCK_ADDRESS: u64 = 2;
 /// Block address where the journal area begins.
 pub const BAFS_JOURNAL_START_BLOCK_ADDRESS: u64 = 3;
 
-/// Number of blocks reserved for the journal (1 MiB at 4 KiB/block).
-pub const BAFS_DEFAULT_JOURNAL_SIZE_BLOCKS: u64 = 256;
+/// Minimum journal size in blocks (1 MiB at 4 KiB/block).
+///
+/// Even a tiny disk gets at least 256 journal blocks so the filesystem has
+/// room to absorb bursts of metadata writes without stalling on every commit.
+pub const BAFS_JOURNAL_SIZE_MIN_BLOCKS: u64 = 256; // 1 MiB
 
-/// Block address of the first block in the data area (immediately after the
-/// journal).
-pub const BAFS_DATA_AREA_START_BLOCK_ADDRESS: u64 =
-    BAFS_JOURNAL_START_BLOCK_ADDRESS + BAFS_DEFAULT_JOURNAL_SIZE_BLOCKS;
+/// Maximum journal size in blocks (64 MiB at 4 KiB/block).
+///
+/// 64 MiB is the same cap used by APFS and BTRFS.  Beyond 64 MiB the
+/// journal replay time at boot dominates the benefit of a larger ring buffer.
+pub const BAFS_JOURNAL_SIZE_MAX_BLOCKS: u64 = 16_384; // 64 MiB
+
+/// Compute the journal size for a disk with `total_block_count` 4 KiB blocks.
+///
+/// The formula is: clamp(1% of disk, 1 MiB, 64 MiB).
+///
+/// | Disk size | Journal |
+/// |-----------|---------|
+/// | 256 MiB   |   1 MiB (minimum) |
+/// | 1 GiB     |  ~10 MiB |
+/// | 256 GiB   |  64 MiB (maximum) |
+/// | 100 TiB   |  64 MiB (maximum) |
+pub fn compute_journal_size_in_blocks(total_block_count: u64) -> u64 {
+    let one_percent_of_total = total_block_count / 100;
+    one_percent_of_total
+        .max(BAFS_JOURNAL_SIZE_MIN_BLOCKS)
+        .min(BAFS_JOURNAL_SIZE_MAX_BLOCKS)
+}
+
+/// Compute the block address of the first block in the data area.
+///
+/// The data area begins immediately after the journal.  The journal size is
+/// determined dynamically from the disk capacity.
+pub fn compute_data_area_start_block(total_block_count: u64) -> u64 {
+    BAFS_JOURNAL_START_BLOCK_ADDRESS + compute_journal_size_in_blocks(total_block_count)
+}
 
 /// Checksum algorithm identifier stored in the superblock: 0 = CRC32C.
 pub const BAFS_CHECKSUM_ALGORITHM_CRC32C: u32 = 0;

@@ -13,9 +13,9 @@
 //!    ITEM_TYPE_EXTENT_DATA, block_address)`) recording which block runs are
 //!    available for allocation.
 //!
-//! # Allocation algorithm (v1)
+//! # Allocation algorithm
 //!
-//! v1 uses a simple first-fit strategy:
+//! Uses a simple first-fit strategy:
 //! 1. Scan the free-extent B-tree for the first entry with `block_count` ≥ the
 //!    requested size.
 //! 2. Remove that entry.
@@ -310,8 +310,15 @@ pub fn allocate_blocks(
 
 /// Return `block_count` blocks starting at `block_address` to the free pool.
 ///
-/// Inserts a new free-extent record into the free-extent B-tree.  v1 does not
-/// coalesce adjacent free extents (that is a v2+ optimisation).
+/// Coalesces adjacent free extents before inserting so that the free-extent
+/// B-tree stays compact on large disks.  The algorithm is:
+///
+/// 1. Scan for a free extent immediately **before** the freed range
+///    (i.e. one whose `block_address + block_count == block_address`).
+/// 2. Scan for a free extent immediately **after** the freed range
+///    (i.e. one whose `block_address == block_address + block_count`).
+/// 3. Remove any adjacent extents found.
+/// 4. Insert a single merged extent that covers all contiguous blocks.
 ///
 /// Returns the new free-extent-tree root block address.
 pub fn free_blocks(
@@ -323,12 +330,84 @@ pub fn free_blocks(
     generation: u64,
     next_free_block: &mut u64,
 ) -> Result<u64, BafsError> {
-    insert_free_extent_into_tree(
+    // Collect all free extents to search for adjacent neighbours.
+    let min_key = BafsKey::new(BAFS_FREE_EXTENT_OBJECT_ID, ITEM_TYPE_EXTENT_DATA, 0);
+    let max_key = BafsKey::new(BAFS_FREE_EXTENT_OBJECT_ID, ITEM_TYPE_EXTENT_DATA, u64::MAX);
+    let all_free_items = iterate_tree_range(
         device,
         dirty_cache,
         free_extent_tree_root_block,
-        block_address,
-        block_count,
+        min_key,
+        max_key,
+    )?;
+
+    // The merged range starts as the caller's freed range.
+    let mut merged_start = block_address;
+    let mut merged_count = block_count;
+    let mut current_root = free_extent_tree_root_block;
+
+    // Check for a free extent that ends exactly where our range begins.
+    let predecessor = all_free_items.iter().find(|item| {
+        let extent = deserialise_free_extent_from_bytes(&item.value);
+        extent.block_address + extent.block_count == block_address
+    });
+
+    if let Some(predecessor_item) = predecessor {
+        let predecessor_extent = deserialise_free_extent_from_bytes(&predecessor_item.value);
+        // Extend the merged range to include the predecessor.
+        merged_start = predecessor_extent.block_address;
+        merged_count += predecessor_extent.block_count;
+        // Remove the predecessor from the tree so it can be replaced by the merged entry.
+        current_root = delete_from_tree(
+            device,
+            dirty_cache,
+            current_root,
+            predecessor_item.key,
+            generation,
+            next_free_block,
+        )?;
+    }
+
+    // Re-collect items after the predecessor removal, then look for a successor.
+    // (Re-scan is necessary because the tree root may have changed after the delete.)
+    let min_key2 = BafsKey::new(BAFS_FREE_EXTENT_OBJECT_ID, ITEM_TYPE_EXTENT_DATA, 0);
+    let max_key2 = BafsKey::new(BAFS_FREE_EXTENT_OBJECT_ID, ITEM_TYPE_EXTENT_DATA, u64::MAX);
+    let updated_free_items = iterate_tree_range(
+        device,
+        dirty_cache,
+        current_root,
+        min_key2,
+        max_key2,
+    )?;
+
+    // Check for a free extent that starts exactly where our merged range ends.
+    let successor = updated_free_items.iter().find(|item| {
+        let extent = deserialise_free_extent_from_bytes(&item.value);
+        extent.block_address == merged_start + merged_count
+    });
+
+    if let Some(successor_item) = successor {
+        let successor_extent = deserialise_free_extent_from_bytes(&successor_item.value);
+        // Extend the merged range to include the successor.
+        merged_count += successor_extent.block_count;
+        // Remove the successor from the tree.
+        current_root = delete_from_tree(
+            device,
+            dirty_cache,
+            current_root,
+            successor_item.key,
+            generation,
+            next_free_block,
+        )?;
+    }
+
+    // Insert the single merged free extent.
+    insert_free_extent_into_tree(
+        device,
+        dirty_cache,
+        current_root,
+        merged_start,
+        merged_count,
         generation,
         next_free_block,
     )
