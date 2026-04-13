@@ -247,7 +247,8 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
         volume_label: label_words,
         feature_flags: 0,
         checksum_algorithm: BAFS_CHECKSUM_ALGORITHM_CRC32C,
-        reserved: [0u8; 356],
+        next_cow_block_address: next_free_block,
+        reserved: [0u8; 348],
         superblock_checksum: 0, // filled by write_superblock_to_device
     };
 
@@ -302,7 +303,10 @@ pub fn bafs_mount<D: BlockDevice>(device: D) -> Result<BafsVolume<D>, BafsError>
     // Run journal recovery before any other I/O.
     recover_journal_on_mount(&device, &mut superblock)?;
 
-    let next_free_block = superblock.free_block_count; // used as next-free hint on mount
+    // Restore the CoW bump pointer from the superblock so that new tree-node
+    // allocations continue from where the previous mount left off, never
+    // reusing any block already written to disk.
+    let next_free_block = superblock.next_cow_block_address;
     let next_transaction_id = superblock.last_committed_transaction_id + 1;
 
     Ok(BafsVolume {
@@ -330,6 +334,9 @@ pub fn bafs_unmount<D: BlockDevice>(mut volume: BafsVolume<D>) -> Result<(), Baf
 /// This is called by `bafs_unmount` and can also be called explicitly to
 /// create a checkpoint mid-session.
 pub fn flush_and_commit<D: BlockDevice>(volume: &mut BafsVolume<D>) -> Result<(), BafsError> {
+    // Persist the CoW bump pointer so remount resumes from the correct address.
+    volume.superblock.next_cow_block_address = volume.next_free_block;
+
     let transaction = begin_transaction(volume.next_transaction_id);
     commit_transaction(
         &volume.device,

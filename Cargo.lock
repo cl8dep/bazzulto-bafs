@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "bafs"
 version = "0.1.0"
+
+[[package]]
+name = "bafs-tools"
+version = "0.1.0"
+dependencies = [
+ "bafs",
+]

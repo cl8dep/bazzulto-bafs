@@ -1,0 +1,16 @@
+[package]
+name = "bafs-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side developer CLI for formatting, inspecting, and benchmarking BAFS volumes"
+authors = ["Bazzulto OS Contributors"]
+
+# bafs-tools is only ever built for the host (macOS / Linux).  It is a
+# development aid — not part of the Bazzulto OS userspace.
+
+[[bin]]
+name = "bafs-tools"
+path = "src/main.rs"
+
+[dependencies]
+bafs = { path = "..", features = ["userspace"] }

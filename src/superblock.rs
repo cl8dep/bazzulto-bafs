@@ -205,13 +205,20 @@ pub struct BafsSuperblock {
     /// Checksum algorithm: 0 = CRC32C.  For v1 only CRC32C is supported.
     pub checksum_algorithm: u32,
 
+    /// Address of the next block to allocate for copy-on-write tree nodes.
+    ///
+    /// This is a monotonically increasing bump pointer maintained by the volume
+    /// layer.  It is saved to the superblock on every commit so that, after a
+    /// remount, new CoW allocations continue from where the previous mount left
+    /// off and never reuse or collide with any block already written to disk.
+    ///
+    /// Data block addresses come from the free-extent B-tree (authoritative);
+    /// this field only seeds the CoW tree-node allocator.
+    pub next_cow_block_address: u64,
+
     /// Reserved bytes, zero-filled.  Sized so that `superblock_checksum` lands
     /// at offset 508 and the total struct size is exactly 512 bytes.
-    ///
-    /// Note: the BAFS specification lists this as 424 bytes, which would give a
-    /// total of 580 bytes — a typo in the spec.  The correct value is 356 bytes
-    /// to achieve the documented 512-byte total with the checksum at offset 508.
-    pub reserved: [u8; 356],
+    pub reserved: [u8; 348],
 
     /// CRC32C of bytes 0..508 of the serialised superblock (i.e. everything
     /// except this field itself).

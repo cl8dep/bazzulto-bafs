@@ -1,3 +1,22 @@
+# This file serves a dual role:
+#
+#   1. [package]   — declares the `bafs` library crate (src/lib.rs).
+#   2. [workspace] — groups the library with the host-side developer CLI.
+#
+# Having both in one file is the standard Cargo pattern for a "root crate +
+# sibling tools" layout.  Running `cargo test` from the workspace root (or from
+# /tmp with --manifest-path) exercises the library.  Running
+# `cargo run -p bafs-tools -- <subcommand>` runs the developer CLI.
+
+[workspace]
+members = [
+    ".",           # the bafs library itself
+    "bafs-tools",  # host-side developer CLI (macOS / Linux only)
+]
+resolver = "2"
+
+# ─── Library package ──────────────────────────────────────────────────────────
+
 [package]
 name = "bafs"
 version = "0.1.0"
@@ -7,11 +26,10 @@ authors = ["Bazzulto OS Contributors"]
 
 # ─── Feature flags ────────────────────────────────────────────────────────────
 #
-# kernel   — activates no_std + alloc mode and implements the kernel VFS Inode
-#            trait so the filesystem can be mounted inside the Bazzulto kernel.
+# kernel    — activates no_std + alloc mode and implements the kernel VFS Inode
+#             trait so the filesystem can be mounted inside the Bazzulto kernel.
 #
-# userspace — activates std mode for host-side tooling (bafs-mkfs, bafs-fsck)
-#             and for the integration test suite.
+# userspace — activates std mode for host-side tooling and the integration tests.
 #
 # If neither feature is active the crate still compiles but only the core
 # on-disk structures and algorithms are exposed (useful as a library).
