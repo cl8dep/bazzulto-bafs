@@ -1,3 +1,15 @@
+/*
+ * Copyright (C) 2026 Arael David Espinosa Pérez
+ *
+ * This program is free software: you can redistribute and/or modify it
+ * under the terms of the GNU General Public License published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY.
+ */
+
 //! BAFS checksum tree: per-data-block CRC32C storage and verification.
 //!
 //! While metadata blocks (B-tree nodes, superblock) carry their CRC32C

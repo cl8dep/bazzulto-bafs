@@ -1,3 +1,15 @@
+/*
+ * Copyright (C) 2026 Arael David Espinosa Pérez
+ *
+ * This program is free software: you can redistribute and/or modify it
+ * under the terms of the GNU General Public License published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY.
+ */
+
 //! CRC32C (Castagnoli) checksum implementation for BAFS.
 //!
 //! Every metadata block and every data block stored by BAFS carries a CRC32C

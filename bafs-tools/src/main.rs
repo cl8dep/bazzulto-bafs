@@ -1,3 +1,15 @@
+/*
+ * Copyright (C) 2026 Arael David Espinosa Pérez
+ *
+ * This program is free software: you can redistribute and/or modify it
+ * under the terms of the GNU General Public License published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY.
+ */
+
 //! bafs-tools — host-side developer CLI for BAFS volumes.
 //!
 //! This binary is a **development tool** for use on macOS and Linux.  It is
