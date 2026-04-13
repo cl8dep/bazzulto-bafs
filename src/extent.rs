@@ -246,6 +246,17 @@ pub fn insert_free_extent_into_tree(
 /// the entry was larger than needed, re-inserts the remainder.
 ///
 /// Returns `(starting_block_address, new_free_extent_tree_root_block)`.
+/// Allocate `requested_block_count` contiguous blocks from the free-extent tree.
+///
+/// `metadata_reserved_end` is the address of the first block that the metadata
+/// bump-pointer allocator has NOT yet claimed.  Any free-extent entry whose
+/// `block_address` is less than `metadata_reserved_end` overlaps with the
+/// metadata zone and must be trimmed before use — the usable portion starts
+/// at `metadata_reserved_end`.  This keeps the metadata bump-pointer zone and
+/// the file-data zone strictly non-overlapping without requiring any separate
+/// bitmap or zone descriptor.
+///
+/// Returns `(starting_block_address, new_free_extent_tree_root_block)`.
 pub fn allocate_blocks(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -253,6 +264,7 @@ pub fn allocate_blocks(
     requested_block_count: u64,
     generation: u64,
     next_free_block: &mut u64,
+    metadata_reserved_end: u64,
 ) -> Result<(u64, u64), BafsError> {
     // Collect all free extents in ascending block-address order.
     let min_key = BafsKey::new(BAFS_FREE_EXTENT_OBJECT_ID, ITEM_TYPE_EXTENT_DATA, 0);
@@ -266,17 +278,29 @@ pub fn allocate_blocks(
         max_key,
     )?;
 
-    // Find the first entry large enough.
+    // Find the first entry large enough, taking the metadata reserved zone into
+    // account.  If a candidate extent starts below `metadata_reserved_end`, its
+    // usable portion begins at `metadata_reserved_end`; entries that are
+    // entirely inside the metadata zone are skipped.
     let chosen_free_extent = all_free_items
         .iter()
         .find(|item| {
             let extent = deserialise_free_extent_from_bytes(&item.value);
-            extent.block_count >= requested_block_count
+            let usable_start = extent.block_address.max(metadata_reserved_end);
+            let extent_end = extent.block_address + extent.block_count;
+            if usable_start >= extent_end {
+                return false; // entirely in metadata zone
+            }
+            let usable_count = extent_end - usable_start;
+            usable_count >= requested_block_count
         })
         .ok_or(BafsError::OutOfSpace)?
         .clone();
 
     let free_extent = deserialise_free_extent_from_bytes(&chosen_free_extent.value);
+
+    // Compute the usable start address inside this extent.
+    let usable_start = free_extent.block_address.max(metadata_reserved_end);
 
     // Remove the chosen free-extent entry from the tree.
     let mut current_root = free_extent_tree_root_block;
@@ -289,9 +313,14 @@ pub fn allocate_blocks(
         next_free_block,
     )?;
 
-    // If the chosen extent is larger than needed, re-insert the remainder.
-    let allocated_block_address = free_extent.block_address;
-    let remaining_block_count = free_extent.block_count - requested_block_count;
+    // If the extent started below metadata_reserved_end, the leading portion
+    // is in the metadata zone — discard it (do not re-insert; it is claimed by
+    // the metadata bump pointer and was never truly free for data).
+
+    // Re-insert the tail remainder after the allocated run, if any.
+    let allocated_block_address = usable_start;
+    let extent_end = free_extent.block_address + free_extent.block_count;
+    let remaining_block_count = extent_end.saturating_sub(usable_start + requested_block_count);
     if remaining_block_count > 0 {
         let remainder_block_address = allocated_block_address + requested_block_count;
         current_root = insert_free_extent_into_tree(

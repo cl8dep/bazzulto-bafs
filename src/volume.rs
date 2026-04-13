@@ -29,7 +29,7 @@ use alloc::{collections::BTreeMap, vec, vec::Vec};
 use std::{collections::BTreeMap, vec, vec::Vec};
 
 use crate::block_device::BlockDevice;
-use crate::btree::{create_empty_tree, write_block_to_cache};
+use crate::btree::{create_empty_tree, delete_from_tree, write_block_to_cache, BafsKey, ITEM_TYPE_EXTENT_DATA};
 use crate::checksum_tree::{store_data_block_checksum, verify_data_block_checksum};
 use crate::dir::{
     directory_create_entry, directory_iterate, directory_list_all_entries,
@@ -51,8 +51,8 @@ use crate::superblock::{
     read_superblock_from_device, write_superblock_to_device, BafsSuperblock,
     BAFS_BACKUP_SUPERBLOCK_BLOCK_ADDRESS, BAFS_CHECKSUM_ALGORITHM_CRC32C,
     BAFS_DEFAULT_BLOCK_SIZE_BYTES, BAFS_JOURNAL_START_BLOCK_ADDRESS,
-    BAFS_MAGIC_NUMBER, BAFS_PRIMARY_SUPERBLOCK_BLOCK_ADDRESS, BAFS_ROOT_INODE_NUMBER,
-    BAFS_SECTORS_PER_BLOCK, BAFS_SUPPORTED_VERSION,
+    BAFS_FREE_EXTENT_OBJECT_ID, BAFS_MAGIC_NUMBER, BAFS_PRIMARY_SUPERBLOCK_BLOCK_ADDRESS,
+    BAFS_ROOT_INODE_NUMBER, BAFS_SECTORS_PER_BLOCK, BAFS_SUPPORTED_VERSION,
 };
 
 // ─── Format options ───────────────────────────────────────────────────────────
@@ -82,6 +82,37 @@ impl Default for BafsFormatOptions {
 // These are NOT compile-time constants because the journal size — and therefore
 // the data-area start — depends on the total disk capacity.  All format-time
 // block addresses are computed at runtime inside `bafs_format`.
+
+// ─── CoW block allocation model ───────────────────────────────────────────────
+//
+// BAFS uses two completely separate allocators — one for metadata, one for
+// file data — so that neither can interfere with the other.  This mirrors the
+// design of APFS, which keeps a separate node-pool allocator for its B-tree
+// metadata distinct from the container free-list that manages file data.
+//
+// METADATA (B-tree CoW nodes)
+//   Allocated by a simple linear bump pointer stored in
+//   `superblock.next_cow_block_address`.  On mount this pointer is loaded into
+//   `BafsVolume::next_free_block`.  Every B-tree CoW clone takes the next
+//   address from this pointer and increments it.  The pointer only moves
+//   forward; freed CoW nodes are simply abandoned (old snapshots of a path
+//   after a CoW are not reclaimed in v1).  The final value of the pointer is
+//   persisted to the superblock on every commit.
+//
+// FILE DATA (extents)
+//   Allocated from the free-extent B-tree via `allocate_blocks`.  The
+//   free-extent tree tracks ranges of blocks that are available for user data.
+//   It is completely independent of the metadata bump pointer.
+//
+// Because CoW nodes always receive real disk addresses (not virtual
+// placeholders) there is NO address-translation step at commit time.  Commit
+// simply journals all dirty blocks — both CoW metadata nodes and data blocks —
+// exactly as they are.
+//   3. Builds a translation map: virtual CoW address → real disk address.
+//   4. Rewrites every reference inside dirty blocks (in node headers and
+//      internal-node child pointers) from virtual to real addresses.
+//   5. Writes the translated dirty cache to the journal and then to disk.
+//
 
 // ─── Volume handle ────────────────────────────────────────────────────────────
 
@@ -115,11 +146,12 @@ pub struct BafsVolume<D: BlockDevice> {
 ///
 /// This function writes:
 /// 1. An empty inode B-tree root at block `FORMAT_INODE_TREE_ROOT_BLOCK`.
-/// 2. A free-extent B-tree root with one entry covering all remaining data blocks.
+/// 2. An empty free-extent B-tree root.
 /// 3. An empty checksum B-tree root.
 /// 4. The root directory inode (inode number 1) inside the inode B-tree.
-/// 5. The primary and backup superblocks.
-/// 6. Zero-fills the journal area.
+/// 5. One free-extent entry covering all blocks not consumed by steps 1–4.
+/// 6. The primary and backup superblocks.
+/// 7. Zero-fills the journal area.
 ///
 /// After this function returns, `bafs_mount` can be called on the same device.
 pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Result<(), BafsError> {
@@ -149,6 +181,10 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
     // ── Build format-time structures in a dirty-block cache ──────────────────
 
     let mut dirty_cache: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    // During format, CoW nodes are allocated from format_first_allocatable_block
+    // upward using a real bump pointer.  These blocks are NOT registered in the
+    // free-extent tree; instead, the free-extent tree's initial entry is adjusted
+    // to start after however many format-time CoW nodes were consumed.
     let mut next_free_block = format_first_allocatable_block;
     let format_generation: u64 = 1;
 
@@ -159,26 +195,18 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
         format_generation,
     );
 
-    // ── (2) Free-extent B-tree root with one entry ────────────────────────────
+    // ── (2) Empty free-extent B-tree root ────────────────────────────────────
     //
-    // The initial free extent covers all blocks from format_first_allocatable_block
-    // to the end of the device.
+    // The free-extent entry is NOT inserted yet.  We insert it last, after all
+    // other CoW tree operations have consumed blocks from format_first_allocatable_block
+    // upward.  At that point next_free_block tells us where the real free data
+    // starts, and we insert exactly one entry: (next_free_block, remaining_count).
     create_empty_tree(
         &mut dirty_cache,
         format_free_extent_tree_root_block,
         format_generation,
     );
     let mut free_extent_root = format_free_extent_tree_root_block;
-    let initial_free_block_count = total_block_count - format_first_allocatable_block;
-    free_extent_root = insert_free_extent_into_tree(
-        device,
-        &mut dirty_cache,
-        free_extent_root,
-        format_first_allocatable_block,
-        initial_free_block_count,
-        format_generation,
-        &mut next_free_block,
-    )?;
 
     // ── (3) Empty checksum B-tree root ────────────────────────────────────────
     create_empty_tree(
@@ -229,12 +257,78 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
     };
     label_bytes_ref.copy_from_slice(&options.volume_label);
 
+    // ── (5b) Insert the free-extent tree entry last ───────────────────────────
+    //
+    // All preceding CoW tree operations (inode tree, checksum tree) used
+    // next_free_block as a real bump pointer starting at format_first_allocatable_block.
+    // Those blocks are now permanently consumed by tree nodes.  The free extent
+    // must start at the current value of next_free_block, not at
+    // format_first_allocatable_block.
+    //
+    // The insert itself may produce at most one additional CoW node (a root
+    // split on an empty tree never occurs, so the tree stays height-0 for 1
+    // item).  If next_free_block advances during the insert, we delete the
+    // entry we just inserted and re-insert with the updated start.  This loop
+    // converges in at most 2 iterations.
+
+    {
+        let free_start_first_attempt = next_free_block;
+        let free_count_first_attempt = total_block_count
+            .saturating_sub(free_start_first_attempt);
+        if free_count_first_attempt == 0 {
+            return Err(BafsError::OutOfSpace);
+        }
+        free_extent_root = insert_free_extent_into_tree(
+            device,
+            &mut dirty_cache,
+            free_extent_root,
+            free_start_first_attempt,
+            free_count_first_attempt,
+            format_generation,
+            &mut next_free_block,
+        )?;
+
+        // If next_free_block advanced, the entry we just inserted is too broad
+        // (it claims blocks that were just consumed as CoW nodes).  Fix it.
+        if next_free_block > free_start_first_attempt {
+            let old_key = BafsKey::new(
+                BAFS_FREE_EXTENT_OBJECT_ID,
+                ITEM_TYPE_EXTENT_DATA,
+                free_start_first_attempt,
+            );
+            free_extent_root = delete_from_tree(
+                device,
+                &mut dirty_cache,
+                free_extent_root,
+                old_key,
+                format_generation,
+                &mut next_free_block,
+            )?;
+
+            let free_start_final = next_free_block;
+            let free_count_final = total_block_count.saturating_sub(free_start_final);
+            if free_count_final > 0 {
+                free_extent_root = insert_free_extent_into_tree(
+                    device,
+                    &mut dirty_cache,
+                    free_extent_root,
+                    free_start_final,
+                    free_count_final,
+                    format_generation,
+                    &mut next_free_block,
+                )?;
+            }
+        }
+    }
+
+    let final_free_block_count = total_block_count.saturating_sub(next_free_block);
+
     let mut superblock = BafsSuperblock {
         magic_number: BAFS_MAGIC_NUMBER,
         version: BAFS_SUPPORTED_VERSION,
         block_size_in_bytes: BAFS_DEFAULT_BLOCK_SIZE_BYTES,
         total_block_count,
-        free_block_count: initial_free_block_count,
+        free_block_count: final_free_block_count,
         allocated_inode_count: 1, // root inode
         last_committed_transaction_id: 1,
         root_inode_number: BAFS_ROOT_INODE_NUMBER,
@@ -263,7 +357,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
         }
     }
 
-    // ── (7) Write all dirty blocks to their final locations ───────────────────
+    // ── (8) Write all dirty blocks to their final locations ───────────────────
 
     for (&block_address, block_data) in &dirty_cache {
         let lba = block_address * sectors_per_block as u64;
@@ -272,7 +366,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
         }
     }
 
-    // ── (8) Write the superblock (backup first, then primary) ─────────────────
+    // ── (9) Write the superblock (backup first, then primary) ─────────────────
 
     write_superblock_to_device(device, &mut superblock)?;
 
@@ -303,9 +397,9 @@ pub fn bafs_mount<D: BlockDevice>(device: D) -> Result<BafsVolume<D>, BafsError>
     // Run journal recovery before any other I/O.
     recover_journal_on_mount(&device, &mut superblock)?;
 
-    // Restore the CoW bump pointer from the superblock so that new tree-node
-    // allocations continue from where the previous mount left off, never
-    // reusing any block already written to disk.
+    // The metadata bump pointer is persisted in the superblock so that across
+    // mounts CoW nodes always advance into fresh territory and never overwrite
+    // previously written blocks.
     let next_free_block = superblock.next_cow_block_address;
     let next_transaction_id = superblock.last_committed_transaction_id + 1;
 
@@ -333,10 +427,18 @@ pub fn bafs_unmount<D: BlockDevice>(mut volume: BafsVolume<D>) -> Result<(), Baf
 ///
 /// This is called by `bafs_unmount` and can also be called explicitly to
 /// create a checkpoint mid-session.
+///
+/// All dirty blocks — both CoW metadata nodes and file-data blocks — carry
+/// real disk addresses from the moment they are created, so no address
+/// translation is needed at commit time.
 pub fn flush_and_commit<D: BlockDevice>(volume: &mut BafsVolume<D>) -> Result<(), BafsError> {
-    // Persist the CoW bump pointer so remount resumes from the correct address.
+    // Persist the metadata bump-pointer so the next mount resumes from the
+    // correct position and never reuses blocks written in previous sessions.
     volume.superblock.next_cow_block_address = volume.next_free_block;
 
+    // Commit all dirty blocks (metadata CoW nodes + file-data blocks) to the
+    // journal and then to their final on-disk locations.  No address translation
+    // is needed because every block already carries a real disk address.
     let transaction = begin_transaction(volume.next_transaction_id);
     commit_transaction(
         &volume.device,
@@ -344,8 +446,10 @@ pub fn flush_and_commit<D: BlockDevice>(volume: &mut BafsVolume<D>) -> Result<()
         &volume.dirty_block_cache,
         &mut volume.superblock,
     )?;
+
     volume.dirty_block_cache.clear();
     volume.next_transaction_id += 1;
+
     Ok(())
 }
 
@@ -369,6 +473,10 @@ fn allocate_and_write_data_blocks<D: BlockDevice>(
     }
 
     // Allocate from the free-extent tree.
+    // Pass `next_free_block` as `metadata_reserved_end` so that data blocks are
+    // never handed out from the address range currently claimed by the metadata
+    // bump-pointer allocator.
+    let metadata_reserved_end = volume.next_free_block;
     let (allocated_block_address, new_free_extent_root) = allocate_blocks(
         &volume.device,
         &mut volume.dirty_block_cache,
@@ -376,6 +484,7 @@ fn allocate_and_write_data_blocks<D: BlockDevice>(
         block_count_needed,
         generation,
         &mut volume.next_free_block,
+        metadata_reserved_end,
     )?;
 
     volume.superblock.free_extent_tree_root_block = new_free_extent_root;
