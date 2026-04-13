@@ -143,6 +143,9 @@ fn deserialise_free_extent_from_bytes(bytes: &[u8]) -> BafsFreeExtent {
 /// Store an extent data record for a file in the inode B-tree.
 ///
 /// Returns the (possibly new) inode-tree root block address.
+///
+/// `freed_blocks` is appended with block addresses superseded by CoW clones;
+/// thread it through from the top-level operation.
 pub fn write_extent_data_to_inode_tree(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -151,6 +154,7 @@ pub fn write_extent_data_to_inode_tree(
     extent: &BafsExtentData,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     let key = BafsKey::new(inode_number, ITEM_TYPE_EXTENT_DATA, extent.logical_byte_offset);
     let value = serialise_extent_data_to_bytes(extent).to_vec();
@@ -162,6 +166,7 @@ pub fn write_extent_data_to_inode_tree(
         value,
         generation,
         next_free_block,
+        freed_blocks,
     )
 }
 
@@ -212,6 +217,9 @@ pub fn read_extent_data_for_file_offset(
 /// extent, and by `free_blocks` to return blocks to the pool.
 ///
 /// Returns the new free-extent-tree root block address.
+///
+/// `freed_blocks` is appended with block addresses superseded by CoW clones;
+/// thread it through from the top-level operation.
 pub fn insert_free_extent_into_tree(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -220,6 +228,7 @@ pub fn insert_free_extent_into_tree(
     block_count: u64,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     let free_extent = BafsFreeExtent { block_address, block_count };
     let key = BafsKey::new(
@@ -236,25 +245,20 @@ pub fn insert_free_extent_into_tree(
         value,
         generation,
         next_free_block,
+        freed_blocks,
     )
 }
 
 /// Allocate `requested_block_count` contiguous blocks from the free-extent tree.
 ///
-/// Scans the free-extent B-tree for the first entry with `block_count ≥
-/// requested_block_count` (first-fit strategy).  Removes that entry, and if
-/// the entry was larger than needed, re-inserts the remainder.
+/// Uses a first-fit strategy: scans free extents in ascending block-address
+/// order and takes the first entry large enough.  Removes that entry from the
+/// tree and re-inserts the remainder if the entry was larger than needed.
 ///
-/// Returns `(starting_block_address, new_free_extent_tree_root_block)`.
-/// Allocate `requested_block_count` contiguous blocks from the free-extent tree.
-///
-/// `metadata_reserved_end` is the address of the first block that the metadata
-/// bump-pointer allocator has NOT yet claimed.  Any free-extent entry whose
-/// `block_address` is less than `metadata_reserved_end` overlaps with the
-/// metadata zone and must be trimmed before use — the usable portion starts
-/// at `metadata_reserved_end`.  This keeps the metadata bump-pointer zone and
-/// the file-data zone strictly non-overlapping without requiring any separate
-/// bitmap or zone descriptor.
+/// The free-extent tree only contains blocks outside the metadata CoW zone
+/// (maintained by the caller's bump pointer).  No address filtering is needed
+/// here; the caller guarantees that the tree never contains entries inside the
+/// live CoW zone.
 ///
 /// Returns `(starting_block_address, new_free_extent_tree_root_block)`.
 pub fn allocate_blocks(
@@ -264,7 +268,7 @@ pub fn allocate_blocks(
     requested_block_count: u64,
     generation: u64,
     next_free_block: &mut u64,
-    metadata_reserved_end: u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<(u64, u64), BafsError> {
     // Collect all free extents in ascending block-address order.
     let min_key = BafsKey::new(BAFS_FREE_EXTENT_OBJECT_ID, ITEM_TYPE_EXTENT_DATA, 0);
@@ -278,31 +282,19 @@ pub fn allocate_blocks(
         max_key,
     )?;
 
-    // Find the first entry large enough, taking the metadata reserved zone into
-    // account.  If a candidate extent starts below `metadata_reserved_end`, its
-    // usable portion begins at `metadata_reserved_end`; entries that are
-    // entirely inside the metadata zone are skipped.
+    // First-fit: find the first entry with enough contiguous blocks.
     let chosen_free_extent = all_free_items
         .iter()
         .find(|item| {
             let extent = deserialise_free_extent_from_bytes(&item.value);
-            let usable_start = extent.block_address.max(metadata_reserved_end);
-            let extent_end = extent.block_address + extent.block_count;
-            if usable_start >= extent_end {
-                return false; // entirely in metadata zone
-            }
-            let usable_count = extent_end - usable_start;
-            usable_count >= requested_block_count
+            extent.block_count >= requested_block_count
         })
         .ok_or(BafsError::OutOfSpace)?
         .clone();
 
     let free_extent = deserialise_free_extent_from_bytes(&chosen_free_extent.value);
 
-    // Compute the usable start address inside this extent.
-    let usable_start = free_extent.block_address.max(metadata_reserved_end);
-
-    // Remove the chosen free-extent entry from the tree.
+    // Remove the chosen entry from the tree.
     let mut current_root = free_extent_tree_root_block;
     current_root = delete_from_tree(
         device,
@@ -311,16 +303,12 @@ pub fn allocate_blocks(
         chosen_free_extent.key,
         generation,
         next_free_block,
+        freed_blocks,
     )?;
 
-    // If the extent started below metadata_reserved_end, the leading portion
-    // is in the metadata zone — discard it (do not re-insert; it is claimed by
-    // the metadata bump pointer and was never truly free for data).
-
-    // Re-insert the tail remainder after the allocated run, if any.
-    let allocated_block_address = usable_start;
-    let extent_end = free_extent.block_address + free_extent.block_count;
-    let remaining_block_count = extent_end.saturating_sub(usable_start + requested_block_count);
+    // Re-insert the remainder, if any.
+    let allocated_block_address = free_extent.block_address;
+    let remaining_block_count = free_extent.block_count - requested_block_count;
     if remaining_block_count > 0 {
         let remainder_block_address = allocated_block_address + requested_block_count;
         current_root = insert_free_extent_into_tree(
@@ -331,6 +319,7 @@ pub fn allocate_blocks(
             remaining_block_count,
             generation,
             next_free_block,
+            freed_blocks,
         )?;
     }
 
@@ -358,6 +347,7 @@ pub fn free_blocks(
     block_count: u64,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     // Collect all free extents to search for adjacent neighbours.
     let min_key = BafsKey::new(BAFS_FREE_EXTENT_OBJECT_ID, ITEM_TYPE_EXTENT_DATA, 0);
@@ -394,6 +384,7 @@ pub fn free_blocks(
             predecessor_item.key,
             generation,
             next_free_block,
+            freed_blocks,
         )?;
     }
 
@@ -427,6 +418,7 @@ pub fn free_blocks(
             successor_item.key,
             generation,
             next_free_block,
+            freed_blocks,
         )?;
     }
 
@@ -439,5 +431,6 @@ pub fn free_blocks(
         merged_count,
         generation,
         next_free_block,
+        freed_blocks,
     )
 }

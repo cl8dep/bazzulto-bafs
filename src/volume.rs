@@ -225,6 +225,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
         0, // timestamp: zero for a freshly formatted volume
     );
 
+    let mut format_freed_blocks: Vec<u64> = Vec::new();
     inode_root = write_inode_to_tree(
         device,
         &mut dirty_cache,
@@ -232,6 +233,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
         &root_inode,
         format_generation,
         &mut next_free_block,
+        &mut format_freed_blocks,
     )?;
 
     // ── (5) Build the superblock ──────────────────────────────────────────────
@@ -286,6 +288,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
             free_count_first_attempt,
             format_generation,
             &mut next_free_block,
+            &mut format_freed_blocks,
         )?;
 
         // If next_free_block advanced, the entry we just inserted is too broad
@@ -303,6 +306,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
                 old_key,
                 format_generation,
                 &mut next_free_block,
+                &mut format_freed_blocks,
             )?;
 
             let free_start_final = next_free_block;
@@ -316,6 +320,7 @@ pub fn bafs_format(device: &dyn BlockDevice, options: BafsFormatOptions) -> Resu
                     free_count_final,
                     format_generation,
                     &mut next_free_block,
+                    &mut format_freed_blocks,
                 )?;
             }
         }
@@ -455,6 +460,69 @@ pub fn flush_and_commit<D: BlockDevice>(volume: &mut BafsVolume<D>) -> Result<()
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
+/// Return CoW-obsolete block addresses to the free-extent tree for reuse.
+///
+/// Every B-tree insert or delete clones the modified path (CoW), making the
+/// old nodes obsolete.  This function sorts those obsolete blocks into two
+/// categories:
+///
+/// - **Intra-transaction** (address ≥ `superblock.next_cow_block_address`):
+///   these nodes were allocated during the *current* session's bump-pointer
+///   run and never reached disk.  They are simply ignored — the bump pointer
+///   already moved past them and no future allocation will reuse those
+///   addresses.  Critically, they are NOT evicted from the dirty cache,
+///   because the same address could legitimately have been reused for a
+///   different purpose within the same transaction.
+///
+/// - **Cross-session** (address < `superblock.next_cow_block_address`):
+///   these nodes were committed to disk in a previous session and then
+///   superseded by a CoW clone in this session.  They are genuine free space
+///   and are inserted back into the free-extent tree so future allocations
+///   (both data and metadata) can reuse them.
+///
+/// The free-extent tree modifications themselves produce CoW obsolete blocks;
+/// those are always intra-transaction and handled by the recursion terminating
+/// immediately on the second call.
+fn return_freed_cow_blocks_to_free_extent_tree<D: BlockDevice>(
+    volume: &mut BafsVolume<D>,
+    freed_blocks: Vec<u64>,
+) -> Result<(), BafsError> {
+    if freed_blocks.is_empty() {
+        return Ok(());
+    }
+    let committed_boundary = volume.superblock.next_cow_block_address;
+    let generation = volume.next_transaction_id;
+    let mut secondary_freed: Vec<u64> = Vec::new();
+
+    for block_address in freed_blocks {
+        if block_address >= committed_boundary {
+            // Intra-transaction: never hit disk.  Leave the dirty cache alone —
+            // do NOT remove, because the address may have been reused within
+            // this transaction for a different node.
+            continue;
+        }
+        // Cross-session: block is on disk and no pointer references it anymore.
+        // Return it to the free-extent tree.
+        let new_root = free_blocks(
+            &volume.device,
+            &mut volume.dirty_block_cache,
+            volume.superblock.free_extent_tree_root_block,
+            block_address,
+            1,
+            generation,
+            &mut volume.next_free_block,
+            &mut secondary_freed,
+        )?;
+        volume.superblock.free_extent_tree_root_block = new_root;
+        volume.superblock.free_block_count += 1;
+    }
+
+    // secondary_freed contains CoW nodes produced by the free_blocks calls above.
+    // All of them are intra-transaction (>= committed_boundary), so the recursion
+    // returns immediately without any further free_blocks calls.
+    return_freed_cow_blocks_to_free_extent_tree(volume, secondary_freed)
+}
+
 /// Allocate `requested_block_count` blocks and write `data` to them.
 ///
 /// Returns the block address of the first allocated block.  Updates the
@@ -472,11 +540,10 @@ fn allocate_and_write_data_blocks<D: BlockDevice>(
         return Err(BafsError::InvalidArgument);
     }
 
-    // Allocate from the free-extent tree.
-    // Pass `next_free_block` as `metadata_reserved_end` so that data blocks are
-    // never handed out from the address range currently claimed by the metadata
-    // bump-pointer allocator.
-    let metadata_reserved_end = volume.next_free_block;
+    // Allocate contiguous blocks from the free-extent tree.
+    // The tree only contains entries outside the live CoW metadata zone, so no
+    // address filtering is needed — allocate_blocks uses plain first-fit.
+    let mut freed_blocks: Vec<u64> = Vec::new();
     let (allocated_block_address, new_free_extent_root) = allocate_blocks(
         &volume.device,
         &mut volume.dirty_block_cache,
@@ -484,7 +551,7 @@ fn allocate_and_write_data_blocks<D: BlockDevice>(
         block_count_needed,
         generation,
         &mut volume.next_free_block,
-        metadata_reserved_end,
+        &mut freed_blocks,
     )?;
 
     volume.superblock.free_extent_tree_root_block = new_free_extent_root;
@@ -519,12 +586,16 @@ fn allocate_and_write_data_blocks<D: BlockDevice>(
             &block_buffer,
             generation,
             &mut volume.next_free_block,
+            &mut freed_blocks,
         )?;
         volume.superblock.checksum_tree_root_block = new_checksum_root;
 
         bytes_written += chunk.len();
     }
     let _ = bytes_written;
+
+    // Return CoW-obsolete metadata blocks to the free-extent tree.
+    return_freed_cow_blocks_to_free_extent_tree(volume, freed_blocks)?;
 
     Ok(allocated_block_address)
 }
@@ -553,6 +624,7 @@ fn volume_write_inode<D: BlockDevice>(
     inode: &BafsInode,
 ) -> Result<(), BafsError> {
     let generation = volume.next_transaction_id;
+    let mut freed_blocks: Vec<u64> = Vec::new();
     let new_root = write_inode_to_tree(
         &volume.device,
         &mut volume.dirty_block_cache,
@@ -560,9 +632,10 @@ fn volume_write_inode<D: BlockDevice>(
         inode,
         generation,
         &mut volume.next_free_block,
+        &mut freed_blocks,
     )?;
     volume.superblock.inode_tree_root_block = new_root;
-    Ok(())
+    return_freed_cow_blocks_to_free_extent_tree(volume, freed_blocks)
 }
 
 /// Allocate a new inode number and increment the superblock counter.
@@ -600,6 +673,7 @@ pub fn volume_create_file<D: BlockDevice>(
     volume_write_inode(volume, &file_inode)?;
 
     // Add the directory entry in the parent directory.
+    let mut freed_blocks: Vec<u64> = Vec::new();
     let new_inode_root = directory_create_entry(
         &volume.device,
         &mut volume.dirty_block_cache,
@@ -610,8 +684,10 @@ pub fn volume_create_file<D: BlockDevice>(
         CHILD_TYPE_REGULAR_FILE,
         generation,
         &mut volume.next_free_block,
+        &mut freed_blocks,
     )?;
     volume.superblock.inode_tree_root_block = new_inode_root;
+    return_freed_cow_blocks_to_free_extent_tree(volume, freed_blocks)?;
 
     Ok(new_inode_number)
 }
@@ -640,6 +716,7 @@ pub fn volume_create_directory<D: BlockDevice>(
     volume_write_inode(volume, &dir_inode)?;
 
     // Add the directory entry in the parent directory.
+    let mut freed_blocks: Vec<u64> = Vec::new();
     let new_inode_root = directory_create_entry(
         &volume.device,
         &mut volume.dirty_block_cache,
@@ -650,8 +727,10 @@ pub fn volume_create_directory<D: BlockDevice>(
         CHILD_TYPE_DIRECTORY,
         generation,
         &mut volume.next_free_block,
+        &mut freed_blocks,
     )?;
     volume.superblock.inode_tree_root_block = new_inode_root;
+    return_freed_cow_blocks_to_free_extent_tree(volume, freed_blocks)?;
 
     Ok(new_inode_number)
 }
@@ -699,6 +778,7 @@ pub fn volume_write_file_data<D: BlockDevice>(
         reserved: 0,
     };
 
+    let mut freed_blocks: Vec<u64> = Vec::new();
     let new_inode_root = write_extent_data_to_inode_tree(
         &volume.device,
         &mut volume.dirty_block_cache,
@@ -707,8 +787,10 @@ pub fn volume_write_file_data<D: BlockDevice>(
         &extent,
         generation,
         &mut volume.next_free_block,
+        &mut freed_blocks,
     )?;
     volume.superblock.inode_tree_root_block = new_inode_root;
+    return_freed_cow_blocks_to_free_extent_tree(volume, freed_blocks)?;
 
     // Update inode metadata.
     let new_size = (write_offset_bytes + data.len() as u64)
@@ -871,6 +953,7 @@ pub fn volume_unlink_directory_entry<D: BlockDevice>(
     .ok_or(BafsError::NotFound)?;
 
     // Remove the directory entry.
+    let mut unlink_freed_blocks: Vec<u64> = Vec::new();
     let new_inode_root = directory_unlink_entry(
         &volume.device,
         &mut volume.dirty_block_cache,
@@ -879,6 +962,7 @@ pub fn volume_unlink_directory_entry<D: BlockDevice>(
         filename,
         generation,
         &mut volume.next_free_block,
+        &mut unlink_freed_blocks,
     )?;
     volume.superblock.inode_tree_root_block = new_inode_root;
 
