@@ -132,26 +132,28 @@ All tests use in-memory `MemoryDisk` and `FaultInjectionDisk` implementations of
 ## Comparison with Other Filesystems
 
 | Feature | BAFS v1 | ext4 | btrfs | APFS | ZFS |
-|---------|---------|------|-------|------|-----|
-| Copy-on-Write | Yes | No | Yes | Yes | Yes |
-| Checksums (data) | CRC32C | Optional (metadata only) | CRC32C / xxHash | Fletcher-64 | Fletcher-4 / SHA-256 |
-| Checksums (metadata) | CRC32C | CRC32C | CRC32C | Fletcher-64 | Fletcher-4 / SHA-256 |
-| Atomic transactions | Journal + CoW | Journal | CoW | CoW | CoW (ZIL) |
-| B-tree structure | Unified B-tree | H-tree (dirs), extents | B-tree+ | B-tree | DMU + ZAP |
-| Extent-based allocation | Yes | Yes | Yes | Yes | Yes (variable block) |
-| Space reclamation on delete | Yes | Yes | Yes | Yes | Yes |
-| Snapshots | Planned (v2) | No | Yes | Yes | Yes |
-| Compression | Planned (v3) | No | zlib/lzo/zstd | lzfse/lz4/zlib | lz4/gzip/zstd |
-| Encryption | Planned (v3) | fscrypt | No (userspace) | Per-file/volume | Native |
-| Deduplication | No | No | Online/offline | Clones | Online/offline |
-| RAID support | No | mdraid | Native (RAID 0/1/5/6) | Fusion Drive | Native (RAID-Z) |
-| Max file size | ~512 TiB | 16 TiB | 16 EiB | 8 EiB | 16 EiB |
-| Max volume size | ~512 TiB | 1 EiB | 16 EiB | 8 EiB | 256 ZiB |
-| External dependencies | **Zero** | libc | libc | Kernel-only | SPL + libc |
-| `no_std` compatible | **Yes** | No | No | No | No |
-| Lines of code | ~3500 | ~60K | ~170K | Proprietary | ~600K |
+|:--------|:-------:|:----:|:-----:|:----:|:---:|
+| Copy-on-Write              | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Data checksums             | :white_check_mark: CRC32C | :x: | :white_check_mark: CRC32C | :white_check_mark: Fletcher-64 | :white_check_mark: SHA-256 |
+| Metadata checksums         | :white_check_mark: CRC32C | :white_check_mark: CRC32C | :white_check_mark: CRC32C | :white_check_mark: Fletcher-64 | :white_check_mark: Fletcher-4 |
+| Atomic transactions        | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| B-tree indexed             | :white_check_mark: | Partial (H-tree) | :white_check_mark: | :white_check_mark: | :x: (DMU+ZAP) |
+| Extent-based allocation    | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Space reclaim on delete    | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Snapshots                  | :clock3: v2 | :x: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Compression                | :clock3: v3 | :x: | :white_check_mark: zstd | :white_check_mark: lzfse | :white_check_mark: zstd |
+| Encryption                 | :clock3: v3 | :white_check_mark: fscrypt | :x: | :white_check_mark: | :white_check_mark: |
+| Deduplication              | :x: | :x: | :white_check_mark: | :white_check_mark: Clones | :white_check_mark: |
+| RAID                       | :x: | :x: (mdraid) | :white_check_mark: Native | :x: (Fusion) | :white_check_mark: RAID-Z |
+| Max file size              | ~512 TiB | 16 TiB | 16 EiB | 8 EiB | 16 EiB |
+| Max volume size            | ~512 TiB | 1 EiB | 16 EiB | 8 EiB | 256 ZiB |
+| Zero external dependencies | **:white_check_mark:** | :x: | :x: | :x: | :x: |
+| `no_std` compatible        | **:white_check_mark:** | :x: | :x: | :x: | :x: |
+| Lines of code              | **~3,500** | ~60K | ~170K | Proprietary | ~600K |
 
-BAFS is intentionally minimal: it prioritizes correctness and `no_std` portability over feature breadth. It targets embedded and hobby OS kernels where zero dependencies and auditability matter more than petabyte-scale features.
+> :white_check_mark: = supported&ensp; :x: = not supported&ensp; :clock3: = planned
+
+BAFS is intentionally minimal: it prioritizes correctness and `no_std` portability over feature breadth. It targets embedded and OS kernels where zero dependencies and auditability matter more than petabyte-scale features.
 
 ## On-Disk Layout
 
