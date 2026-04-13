@@ -145,8 +145,8 @@ All tests use in-memory `MemoryDisk` and `FaultInjectionDisk` implementations of
 | Encryption                 | :clock3: v3 | :white_check_mark: fscrypt | :x: | :white_check_mark: | :white_check_mark: |
 | Deduplication              | :x: | :x: | :white_check_mark: | :white_check_mark: Clones | :white_check_mark: |
 | RAID                       | :x: | :x: (mdraid) | :white_check_mark: Native | :x: (Fusion) | :white_check_mark: RAID-Z |
-| Max file size              | ~512 TiB | 16 TiB | 16 EiB | 8 EiB | 16 EiB |
-| Max volume size            | ~512 TiB | 1 EiB | 16 EiB | 8 EiB | 256 ZiB |
+| Max file size              | 16 EiB | 16 TiB | 16 EiB | 8 EiB | 16 EiB |
+| Max volume size            | 64 ZiB | 1 EiB | 16 EiB | 8 EiB | 256 ZiB |
 | Zero external dependencies | **:white_check_mark:** | :x: | :x: | :x: | :x: |
 | `no_std` compatible        | **:white_check_mark:** | :x: | :x: | :x: | :x: |
 | Lines of code              | **~3,500** | ~60K | ~170K | Proprietary | ~600K |
