@@ -1,57 +1,18 @@
 # .cargo/config.toml for the bafs standalone crate.
 #
-# This file overrides the parent kernel/.cargo/config.toml, which sets
-# target = "aarch64-unknown-none" and enables build-std.  Those settings are
-# correct for building the kernel image, but they break `cargo test` for this
-# crate because the test harness requires std.
+# When BAFS lives as a submodule inside the Bazzulto OS kernel tree, the
+# parent kernel/.cargo/config.toml sets target = "aarch64-unknown-none" and
+# enables build-std.  Those settings break `cargo test` because the test
+# harness requires std.
 #
-# By setting the build target to the native host (aarch64-apple-darwin on
-# Apple Silicon, x86_64-apple-darwin on Intel Mac, or x86_64-unknown-linux-gnu
-# on Linux CI) cargo uses the pre-built std from the toolchain rather than the
-# no_std core/alloc built from source for the kernel.
+# This file overrides the parent by NOT setting [unstable] build-std, which
+# lets cargo use the pre-built std from the toolchain for the host target.
 #
-# To run the integration tests:
-#   cd kernel/src/fs/bafs
-#   cargo test
-#
-# To verify no_std compilation (kernel mode):
-#   cargo build --features kernel --target aarch64-unknown-none \
-#       -Zbuild-std=core,alloc,compiler_builtins \
-#       -Zbuild-std-features=compiler-builtins-mem
-
-# .cargo/config.toml for the bafs standalone crate.
-#
-# IMPORTANT — HOW TO RUN TESTS
-# ─────────────────────────────
-# The parent kernel/.cargo/config.toml sets:
-#
-#   [build]
-#   target = "aarch64-unknown-none"
-#
-#   [unstable]
-#   build-std = ["core", "alloc", "compiler_builtins"]
-#
-# cargo reads config hierarchically from the current working directory upward,
-# so running `cargo test` from within this directory still inherits those
-# settings.  The build-std key is additive (child configs cannot unset it),
-# which causes a "duplicate lang item" error when cargo tries to link both the
-# custom-built core and the host std.
-#
-# Workaround: run cargo from a directory OUTSIDE the kernel tree, passing
-# --manifest-path to point at this Cargo.toml:
+# If running from within the kernel tree still causes "duplicate lang item"
+# errors, run cargo from OUTSIDE the tree:
 #
 #   cd /tmp
-#   cargo test --manifest-path \
-#       /Users/cl8dep/Documents/Development/so/kernel/src/fs/bafs/Cargo.toml
+#   cargo test --manifest-path /path/to/bafs/Cargo.toml
 #
-# That way cargo traverses /tmp upward looking for configs and never finds the
-# kernel config, so the default host target and pre-built std are used.
-#
-# Alternatively, add a Makefile target or shell alias to the repo root that
-# runs the above command.
-#
-# ─── Settings below are applied when building inside the kernel tree ──────────
-# (They don't help with the build-std conflict, but are harmless.)
-
-[build]
-target = "aarch64-apple-darwin"
+# In CI (GitHub Actions) the repo is checked out standalone, so this config
+# is the only one cargo sees and tests run on the native host target.

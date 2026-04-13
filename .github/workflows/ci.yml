@@ -70,10 +70,10 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Generate coverage report
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov --lcov --output-path lcov.info
 
       - name: Generate coverage summary
-        run: cargo llvm-cov --all-features --text 2>&1 | tee coverage-summary.txt
+        run: cargo llvm-cov --text 2>&1 | tee coverage-summary.txt
 
       - name: Print coverage summary
         run: |
