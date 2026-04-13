@@ -119,9 +119,26 @@ impl BafsKey {
 /// Size of the node header in bytes.
 const NODE_HEADER_SIZE_BYTES: usize = 24;
 
-/// Maximum items per leaf node.  Conservative limit so that even with large
-/// values (up to ~60 bytes) a leaf never overflows a 4 KiB block.
-const LEAF_MAX_ITEMS: usize = 60;
+/// Size of one leaf item header: key(17) + data_offset(4) + data_size(4).
+const LEAF_ITEM_HEADER_SIZE_BYTES: usize = 25;
+
+/// Compute the total serialised byte size of a leaf node with the given items.
+///
+/// The on-disk layout packs item headers forward from byte 24 and value data
+/// backward from byte 4096.  This returns the sum of both regions plus the
+/// node header, which must not exceed the block size.
+fn leaf_serialised_size(leaf_items: &[BafsLeafItem]) -> usize {
+    let headers_end = NODE_HEADER_SIZE_BYTES
+        + leaf_items.len() * LEAF_ITEM_HEADER_SIZE_BYTES;
+    let total_value_bytes: usize = leaf_items.iter().map(|item| item.value.len()).sum();
+    headers_end + total_value_bytes
+}
+
+/// Returns true if the leaf node's items would overflow a 4 KiB block when
+/// serialised.
+fn leaf_node_would_overflow(leaf_items: &[BafsLeafItem]) -> bool {
+    leaf_serialised_size(leaf_items) > BAFS_DEFAULT_BLOCK_SIZE_BYTES as usize
+}
 
 /// Maximum items per internal node.  Each internal item is 33 bytes; 90 items
 /// fit comfortably in the remaining space after the 24-byte header.
@@ -559,6 +576,11 @@ fn collect_range(
 /// block address of the (possibly new) root node.
 ///
 /// `next_free_block` is incremented for each new block allocated.
+///
+/// `freed_blocks` is appended with the block addresses of every node that is
+/// superseded by a CoW clone during this operation.  The caller is responsible
+/// for returning those blocks to the free-extent pool after the transaction
+/// commits.
 pub fn insert_into_tree(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -567,6 +589,7 @@ pub fn insert_into_tree(
     value: Vec<u8>,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     // Recursively insert, getting back the (possibly new) root block address.
     let (new_root_address, split_result) = insert_recursive(
@@ -577,12 +600,15 @@ pub fn insert_into_tree(
         value,
         generation,
         next_free_block,
+        freed_blocks,
     )?;
 
     match split_result {
         None => Ok(new_root_address),
         Some(promoted_item) => {
             // The root was split.  Create a new root internal node with two children.
+            // The original root block is superseded; record it as freed.
+            freed_blocks.push(root_block_address);
             let new_root_block = *next_free_block;
             *next_free_block += 1;
 
@@ -640,6 +666,9 @@ struct SplitResult {
 /// node was full and needed to be split, `SplitResult` carries the separator
 /// key and right-hand child address that the caller must insert into the
 /// parent.
+///
+/// `freed_blocks` collects every old block address that is superseded by a CoW
+/// clone so the caller can return them to the free-extent pool.
 fn insert_recursive(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -648,6 +677,7 @@ fn insert_recursive(
     value: Vec<u8>,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<(u64, Option<SplitResult>), BafsError> {
     let mut node = read_tree_node(device, dirty_cache, block_address)?;
 
@@ -666,8 +696,10 @@ fn insert_recursive(
             }
         }
 
-        if node.leaf_items.len() <= LEAF_MAX_ITEMS {
+        if !leaf_node_would_overflow(&node.leaf_items) {
             // Node is within capacity — write it as a CoW clone.
+            // The old block at block_address is superseded.
+            freed_blocks.push(block_address);
             let new_block = *next_free_block;
             *next_free_block += 1;
             node.self_block_address = new_block;
@@ -677,7 +709,7 @@ fn insert_recursive(
         } else {
             // Node is full — split it into two halves.
             let (left_node, right_node, split_key) =
-                split_leaf_node(node, generation, next_free_block);
+                split_leaf_node(node, generation, next_free_block, freed_blocks, block_address);
             let left_block = left_node.self_block_address;
             let right_block = right_node.self_block_address;
             write_tree_node_to_cache(dirty_cache, &left_node);
@@ -698,6 +730,7 @@ fn insert_recursive(
             value,
             generation,
             next_free_block,
+            freed_blocks,
         )?;
 
         // Update the child pointer in this node.
@@ -720,6 +753,8 @@ fn insert_recursive(
 
         if node.internal_items.len() <= INTERNAL_MAX_ITEMS {
             // Within capacity — CoW clone.
+            // The old block at block_address is superseded.
+            freed_blocks.push(block_address);
             let new_block = *next_free_block;
             *next_free_block += 1;
             node.self_block_address = new_block;
@@ -729,7 +764,7 @@ fn insert_recursive(
         } else {
             // Full — split internal node.
             let (left_node, right_node, split_key) =
-                split_internal_node(node, generation, next_free_block);
+                split_internal_node(node, generation, next_free_block, freed_blocks, block_address);
             let left_block = left_node.self_block_address;
             let right_block = right_node.self_block_address;
             write_tree_node_to_cache(dirty_cache, &left_node);
@@ -743,12 +778,35 @@ fn insert_recursive(
 ///
 /// Returns `(left_node, right_node, right_first_key)`.  The right node's first
 /// key is the separator that the parent must insert to route lookups correctly.
+///
+/// `freed_blocks` receives `old_block_address` (the original block being split)
+/// because that block is superseded by the two newly allocated halves.
 fn split_leaf_node(
     mut full_node: BafsTreeNode,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
+    old_block_address: u64,
 ) -> (BafsTreeNode, BafsTreeNode, BafsKey) {
-    let split_index = full_node.leaf_items.len() / 2;
+    // The original node block is superseded by the two new halves.
+    freed_blocks.push(old_block_address);
+
+    // Find a split point where both halves fit in a single block.
+    // Start at the midpoint and adjust if needed.
+    let block_size = BAFS_DEFAULT_BLOCK_SIZE_BYTES as usize;
+    let mut split_index = full_node.leaf_items.len() / 2;
+
+    // Ensure the left half fits; if not, move the split point left.
+    while split_index > 1 && leaf_serialised_size(&full_node.leaf_items[..split_index]) > block_size {
+        split_index -= 1;
+    }
+    // Ensure the right half fits; if not, move the split point right.
+    while split_index < full_node.leaf_items.len() - 1
+        && leaf_serialised_size(&full_node.leaf_items[split_index..]) > block_size
+    {
+        split_index += 1;
+    }
+
     let right_items: Vec<BafsLeafItem> = full_node.leaf_items.drain(split_index..).collect();
     let split_key = right_items[0].key;
 
@@ -779,11 +837,19 @@ fn split_leaf_node(
 ///
 /// The middle separator key is promoted to the parent; it is not stored in
 /// either of the resulting nodes.
+///
+/// `freed_blocks` receives `old_block_address` (the original block being split)
+/// because that block is superseded by the two newly allocated halves.
 fn split_internal_node(
     mut full_node: BafsTreeNode,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
+    old_block_address: u64,
 ) -> (BafsTreeNode, BafsTreeNode, BafsKey) {
+    // The original node block is superseded by the two new halves.
+    freed_blocks.push(old_block_address);
+
     let split_index = full_node.internal_items.len() / 2;
     // The item at `split_index` becomes the promoted separator.
     let promoted_item = full_node.internal_items.remove(split_index);
@@ -796,19 +862,52 @@ fn split_internal_node(
     let left_block = *next_free_block;
     *next_free_block += 1;
 
-    // Re-add the promoted item as the first entry of the right child.
-    let mut right_items_with_promoted = vec![promoted_item];
-    right_items_with_promoted.extend(right_items);
+    // The promoted separator goes UP to the parent — it must NOT appear in
+    // either child.  The right child receives all items that came after the
+    // promoted separator, starting with a new first entry whose key is the
+    // smallest key reachable through the first right child's subtree.
+    //
+    // Concretely: `promoted_item` was the middle item (index split_index).
+    // Its child_block pointer is the leftmost child of the right half.
+    // The right node's separator for that child is `promoted_item.key`, and
+    // the right node contains [promoted_item, right_items[0], right_items[1], ...].
+    //
+    // Wait — in an internal node, each item's `key` is the separator for its
+    // child subtree.  The standard B-tree split for internal nodes:
+    //   left  = items[0 .. split_index]       (kept in full_node)
+    //   mid   = items[split_index]             (promoted to parent)
+    //   right = items[split_index+1 ..]       (in right_node)
+    //
+    // But the right child needs a first entry that routes into mid's child_block.
+    // In BAFS internal nodes, item[i].child_block is the subtree for keys
+    // >= item[i].key (and < item[i+1].key).  So the promoted item's child
+    // becomes the first child of the right node, with key = promoted_item.key.
+    //
+    // This is exactly what the original code did — re-adding promoted_item
+    // as the first entry of the right node — and it IS correct for the BAFS
+    // internal node representation where item[i].key is the *minimum* key of
+    // the subtree rooted at item[i].child_block.
+    //
+    // The promoted key sent to the parent is `promoted_item.key` (the boundary
+    // between left and right subtrees).
+    //
+    // So: right node = [promoted_item, right_items[0], right_items[1], ...].
+    // This means the promoted key appears in both the parent AND as the first
+    // key of the right child.  That is intentional in this representation:
+    // the parent's separator says "all keys >= this go right", and the right
+    // child's first item confirms the minimum key in that subtree.
+    let mut right_items_with_first = vec![promoted_item];
+    right_items_with_first.extend(right_items);
 
     let right_node = BafsTreeNode {
         node_checksum: 0,
         level: full_node.level,
         flags: 0,
-        item_count: right_items_with_promoted.len() as u16,
+        item_count: right_items_with_first.len() as u16,
         self_block_address: right_block,
         generation,
         leaf_items: Vec::new(),
-        internal_items: right_items_with_promoted,
+        internal_items: right_items_with_first,
     };
 
     full_node.item_count = full_node.internal_items.len() as u16;
@@ -824,6 +923,11 @@ fn split_internal_node(
 ///
 /// Returns the new root block address (may change due to CoW or root collapse).
 /// Returns `Err(BafsError::NotFound)` if the key does not exist.
+///
+/// `freed_blocks` is appended with the block addresses of every node that is
+/// superseded by a CoW clone during this operation.  The caller is responsible
+/// for returning those blocks to the free-extent pool after the transaction
+/// commits.
 pub fn delete_from_tree(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -831,6 +935,7 @@ pub fn delete_from_tree(
     target_key: BafsKey,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     let (new_root, _) = delete_recursive(
         device,
@@ -839,6 +944,7 @@ pub fn delete_from_tree(
         target_key,
         generation,
         next_free_block,
+        freed_blocks,
     )?;
     Ok(new_root)
 }
@@ -846,6 +952,9 @@ pub fn delete_from_tree(
 /// Recursive helper for `delete_from_tree`.
 ///
 /// Returns `(new_block_address, key_was_deleted)`.
+///
+/// `freed_blocks` collects every old block address that is superseded by a CoW
+/// clone so the caller can return them to the free-extent pool.
 fn delete_recursive(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -853,6 +962,7 @@ fn delete_recursive(
     target_key: BafsKey,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<(u64, bool), BafsError> {
     let mut node = read_tree_node(device, dirty_cache, block_address)?;
 
@@ -865,6 +975,8 @@ fn delete_recursive(
             Ok(index) => {
                 node.leaf_items.remove(index);
                 node.item_count -= 1;
+                // The old block at block_address is superseded by the CoW clone.
+                freed_blocks.push(block_address);
                 let new_block = *next_free_block;
                 *next_free_block += 1;
                 node.self_block_address = new_block;
@@ -886,6 +998,7 @@ fn delete_recursive(
             target_key,
             generation,
             next_free_block,
+            freed_blocks,
         )?;
 
         if !deleted {
@@ -895,6 +1008,8 @@ fn delete_recursive(
         node.internal_items[child_index].child_block = new_child_block;
         node.internal_items[child_index].child_generation = generation;
 
+        // The old block at block_address is superseded by the CoW clone.
+        freed_blocks.push(block_address);
         let new_block = *next_free_block;
         *next_free_block += 1;
         node.self_block_address = new_block;

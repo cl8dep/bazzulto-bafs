@@ -114,7 +114,7 @@ pub fn serialise_extent_data_to_bytes(extent: &BafsExtentData) -> [u8; 32] {
 }
 
 /// Deserialise 32 bytes into a `BafsExtentData`.
-fn deserialise_extent_data_from_bytes(bytes: &[u8]) -> BafsExtentData {
+pub fn deserialise_extent_data_from_bytes(bytes: &[u8]) -> BafsExtentData {
     debug_assert!(bytes.len() >= 32);
     unsafe { core::ptr::read(bytes.as_ptr() as *const BafsExtentData) }
 }
@@ -282,9 +282,24 @@ pub fn allocate_blocks(
         max_key,
     )?;
 
-    // First-fit: find the first entry with enough contiguous blocks.
+    // Last-fit: find the last entry with enough contiguous blocks and allocate
+    // from its HIGH end.
+    //
+    // Allocating from the high end of the largest free extent is the key to
+    // keeping the data zone and the metadata CoW zone from colliding.
+    //
+    // The metadata CoW bump pointer always grows *forward* from
+    // `next_cow_block_address` (low addresses).  By allocating data blocks from
+    // the *top* of the highest free extent, data blocks and CoW metadata blocks
+    // always grow toward each other from opposite ends of the free space — they
+    // only meet when the disk is genuinely full.
+    //
+    // With first-fit (allocate from the bottom), both CoW metadata and data
+    // would race to claim the same low addresses, causing the remainder to be
+    // consumed by the CoW of the allocation itself.
     let chosen_free_extent = all_free_items
         .iter()
+        .rev()
         .find(|item| {
             let extent = deserialise_free_extent_from_bytes(&item.value);
             extent.block_count >= requested_block_count
@@ -293,6 +308,27 @@ pub fn allocate_blocks(
         .clone();
 
     let free_extent = deserialise_free_extent_from_bytes(&chosen_free_extent.value);
+
+    // Allocate from the HIGH end of this extent.
+    //
+    // allocated = [extent_end - requested, extent_end)
+    // remainder = [extent_start, extent_end - requested)
+    //
+    // The remainder is at LOW addresses — below where CoW can ever reach
+    // (because CoW only grows from next_free_block upward, and next_free_block
+    // is always ≤ extent_start at the time of the call because the free-extent
+    // tree only holds entries beyond the committed CoW zone).
+    //
+    // Actually: next_free_block may grow into the remainder range during the
+    // delete + re-insert CoW operations below.  But the remainder is trimmed
+    // from the TOP, so the HIGH part is what we allocate.  The LOW part
+    // (remainder) stays below next_free_block's current trajectory in the
+    // common case — and if CoW nodes do land in the remainder range, those
+    // blocks are intra-transaction and will be abandoned (not re-inserted in
+    // the free-extent tree).  This is the same intra-transaction waste that
+    // is already accepted for metadata CoW nodes.
+    let extent_end = free_extent.block_address + free_extent.block_count;
+    let allocated_block_address = extent_end - requested_block_count;
 
     // Remove the chosen entry from the tree.
     let mut current_root = free_extent_tree_root_block;
@@ -306,17 +342,26 @@ pub fn allocate_blocks(
         freed_blocks,
     )?;
 
-    // Re-insert the remainder, if any.
-    let allocated_block_address = free_extent.block_address;
-    let remaining_block_count = free_extent.block_count - requested_block_count;
-    if remaining_block_count > 0 {
-        let remainder_block_address = allocated_block_address + requested_block_count;
+    // Re-insert the remainder (the lower portion of the extent), if any.
+    //
+    // The remainder occupies [free_extent.block_address, allocated_block_address).
+    // This range is at LOW addresses relative to what we just allocated, so it
+    // does not conflict with the just-allocated HIGH blocks.
+    //
+    // CoW nodes produced by delete_from_tree go into *next_free_block which
+    // may now overlap with the low-address remainder — but that is fine:
+    // those CoW nodes are intra-transaction and will be abandoned, and the
+    // remainder entry in the free tree only covers addresses that are not
+    // currently occupied by any live CoW node.
+    if allocated_block_address > free_extent.block_address {
+        let remainder_start = free_extent.block_address;
+        let remainder_count = allocated_block_address - free_extent.block_address;
         current_root = insert_free_extent_into_tree(
             device,
             dirty_cache,
             current_root,
-            remainder_block_address,
-            remaining_block_count,
+            remainder_start,
+            remainder_count,
             generation,
             next_free_block,
             freed_blocks,

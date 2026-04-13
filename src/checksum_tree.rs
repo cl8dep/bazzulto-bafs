@@ -85,6 +85,9 @@ fn deserialise_checksum_item_from_bytes(bytes: &[u8]) -> BafsChecksumItem {
 ///
 /// This must be called after every data block write.  Returns the new
 /// checksum-tree root block address (may change due to CoW).
+///
+/// `freed_blocks` is appended with block addresses superseded by CoW clones;
+/// thread it through from the top-level operation.
 pub fn store_data_block_checksum(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -93,6 +96,7 @@ pub fn store_data_block_checksum(
     block_data: &[u8],
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     let crc32c_checksum = compute_crc32c(block_data);
     let checksum_item = BafsChecksumItem {
@@ -116,6 +120,7 @@ pub fn store_data_block_checksum(
         value,
         generation,
         next_free_block,
+        freed_blocks,
     )
 }
 

@@ -350,6 +350,9 @@ pub fn directory_lookup_entry(
 ///
 /// Returns `Err(BafsError::AlreadyExists)` if a file with `child_filename`
 /// already exists in the directory.  Returns the new inode-tree root block.
+///
+/// `freed_blocks` is appended with block addresses superseded by CoW clones;
+/// thread it through from the top-level operation.
 pub fn directory_create_entry(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -360,6 +363,7 @@ pub fn directory_create_entry(
     child_type: u8,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     if child_filename.is_empty() || child_filename.len() > 255 {
         return Err(BafsError::InvalidArgument);
@@ -395,6 +399,7 @@ pub fn directory_create_entry(
         value,
         generation,
         next_free_block,
+        freed_blocks,
     )
 }
 
@@ -405,6 +410,9 @@ pub fn directory_create_entry(
 ///
 /// This function does NOT decrement the child inode's `hard_link_count` or
 /// free its data; that is the responsibility of `volume.rs`.
+///
+/// `freed_blocks` is appended with block addresses superseded by CoW clones;
+/// thread it through from the top-level operation.
 pub fn directory_unlink_entry(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -413,6 +421,7 @@ pub fn directory_unlink_entry(
     target_filename: &str,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     let key = make_directory_entry_key(parent_inode_number, target_filename);
 
@@ -435,6 +444,7 @@ pub fn directory_unlink_entry(
         key,
         generation,
         next_free_block,
+        freed_blocks,
     )
 }
 

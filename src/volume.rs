@@ -29,7 +29,7 @@ use alloc::{collections::BTreeMap, vec, vec::Vec};
 use std::{collections::BTreeMap, vec, vec::Vec};
 
 use crate::block_device::BlockDevice;
-use crate::btree::{create_empty_tree, delete_from_tree, write_block_to_cache, BafsKey, ITEM_TYPE_EXTENT_DATA};
+use crate::btree::{create_empty_tree, delete_from_tree, iterate_tree_range, write_block_to_cache, BafsKey, ITEM_TYPE_EXTENT_DATA, ITEM_TYPE_INODE};
 use crate::checksum_tree::{store_data_block_checksum, verify_data_block_checksum};
 use crate::dir::{
     directory_create_entry, directory_iterate, directory_list_all_entries,
@@ -38,8 +38,9 @@ use crate::dir::{
 };
 use crate::error::BafsError;
 use crate::extent::{
-    allocate_blocks, free_blocks, insert_free_extent_into_tree,
-    read_extent_data_for_file_offset, write_extent_data_to_inode_tree, BafsExtentData,
+    allocate_blocks, deserialise_extent_data_from_bytes, free_blocks,
+    insert_free_extent_into_tree, read_extent_data_for_file_offset,
+    write_extent_data_to_inode_tree, BafsExtentData,
 };
 use crate::inode::{
     allocate_next_inode_number, read_inode_from_tree, write_inode_to_tree, BafsInode,
@@ -540,21 +541,29 @@ fn allocate_and_write_data_blocks<D: BlockDevice>(
         return Err(BafsError::InvalidArgument);
     }
 
-    // Allocate contiguous blocks from the free-extent tree.
-    // The tree only contains entries outside the live CoW metadata zone, so no
-    // address filtering is needed — allocate_blocks uses plain first-fit.
-    let mut freed_blocks: Vec<u64> = Vec::new();
-    let (allocated_block_address, new_free_extent_root) = allocate_blocks(
-        &volume.device,
-        &mut volume.dirty_block_cache,
-        volume.superblock.free_extent_tree_root_block,
-        block_count_needed,
-        generation,
-        &mut volume.next_free_block,
-        &mut freed_blocks,
-    )?;
+    // Allocate data blocks from the bump pointer.
+    //
+    // Both metadata CoW nodes and file data are allocated from the same linear
+    // bump pointer (`next_free_block`).  This is the only design that avoids
+    // the CoW-of-the-allocator paradox: any attempt to allocate data from a
+    // separate free-extent B-tree causes the CoW nodes of that very B-tree
+    // operation to collide with the data blocks being allocated, because both
+    // live in the same address space.
+    //
+    // The free-extent tree is retained for recycling blocks freed by
+    // `volume_unlink_directory_entry` (cross-session blocks returned by
+    // `return_freed_cow_blocks_to_free_extent_tree`), but new allocations
+    // always come from the bump pointer first.
+    //
+    // Out-of-space check: compare current bump pointer against total blocks.
+    let total_blocks = volume.superblock.total_block_count;
+    if volume.next_free_block + block_count_needed > total_blocks {
+        return Err(BafsError::OutOfSpace);
+    }
 
-    volume.superblock.free_extent_tree_root_block = new_free_extent_root;
+    let mut freed_blocks: Vec<u64> = Vec::new();
+    let allocated_block_address = volume.next_free_block;
+    volume.next_free_block += block_count_needed;
     volume.superblock.free_block_count = volume.superblock.free_block_count
         .saturating_sub(block_count_needed);
 
@@ -972,12 +981,66 @@ pub fn volume_unlink_directory_entry<D: BlockDevice>(
     child_inode.hard_link_count = child_inode.hard_link_count.saturating_sub(1);
 
     if child_inode.hard_link_count == 0 {
-        // Free the child inode's data extents (simplified: we just drop the
-        // inode from the tree; extent freeing is a v2+ improvement).
-        // For v1 we leave the blocks as "lost" until an fsck run.
+        // Collect all data extents for this inode.
+        let min_key = BafsKey::new(child_entry.child_inode_number, ITEM_TYPE_EXTENT_DATA, 0);
+        let max_key = BafsKey::new(child_entry.child_inode_number, ITEM_TYPE_EXTENT_DATA, u64::MAX);
+        let extent_items = iterate_tree_range(
+            &volume.device,
+            &volume.dirty_block_cache,
+            volume.superblock.inode_tree_root_block,
+            min_key,
+            max_key,
+        )?;
+
+        let mut inode_root = volume.superblock.inode_tree_root_block;
+        let mut free_extent_root = volume.superblock.free_extent_tree_root_block;
+
+        for extent_item in &extent_items {
+            let extent = deserialise_extent_data_from_bytes(&extent_item.value);
+
+            // Return the data blocks to the free pool.
+            free_extent_root = free_blocks(
+                &volume.device,
+                &mut volume.dirty_block_cache,
+                free_extent_root,
+                extent.first_disk_block,
+                extent.block_count,
+                generation,
+                &mut volume.next_free_block,
+                &mut unlink_freed_blocks,
+            )?;
+
+            // Remove the extent record from the inode tree.
+            inode_root = delete_from_tree(
+                &volume.device,
+                &mut volume.dirty_block_cache,
+                inode_root,
+                extent_item.key,
+                generation,
+                &mut volume.next_free_block,
+                &mut unlink_freed_blocks,
+            )?;
+        }
+
+        // Remove the inode itself from the tree.
+        inode_root = delete_from_tree(
+            &volume.device,
+            &mut volume.dirty_block_cache,
+            inode_root,
+            BafsKey::new(child_entry.child_inode_number, ITEM_TYPE_INODE, 0),
+            generation,
+            &mut volume.next_free_block,
+            &mut unlink_freed_blocks,
+        )?;
+
+        volume.superblock.inode_tree_root_block = inode_root;
+        volume.superblock.free_extent_tree_root_block = free_extent_root;
+        volume.superblock.free_block_count = volume.superblock.free_block_count
+            .saturating_add(child_inode.allocated_block_count);
     } else {
         volume_write_inode(volume, &child_inode)?;
     }
 
+    return_freed_cow_blocks_to_free_extent_tree(volume, unlink_freed_blocks)?;
     Ok(())
 }

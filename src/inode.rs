@@ -254,6 +254,9 @@ pub fn read_inode_from_tree(
 /// Insert or update an inode in the inode B-tree.
 ///
 /// Returns the (possibly new) root block address of the inode B-tree.
+///
+/// `freed_blocks` is appended with block addresses superseded by CoW clones;
+/// thread it through from the top-level operation.
 pub fn write_inode_to_tree(
     device: &dyn BlockDevice,
     dirty_cache: &mut BTreeMap<u64, Vec<u8>>,
@@ -261,6 +264,7 @@ pub fn write_inode_to_tree(
     inode: &BafsInode,
     generation: u64,
     next_free_block: &mut u64,
+    freed_blocks: &mut Vec<u64>,
 ) -> Result<u64, BafsError> {
     let key = BafsKey::new(inode.inode_number, ITEM_TYPE_INODE, 0);
     let value = serialise_inode_to_bytes(inode).to_vec();
@@ -272,6 +276,7 @@ pub fn write_inode_to_tree(
         value,
         generation,
         next_free_block,
+        freed_blocks,
     )
 }
 
